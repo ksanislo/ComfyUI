@@ -21,6 +21,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 from multiprocessing.connection import Connection
 
 #Nothing under comfy is imported at module scope: the child runs this module as
@@ -30,6 +31,9 @@ from multiprocessing.connection import Connection
 #Interrupts reach the child as a signal rather than a message, since it is busy
 #executing rather than reading the connection when one arrives.
 INTERRUPT_SIGNAL = signal.SIGUSR1
+
+#How often the child checks that its server is still there.
+PARENT_POLL_INTERVAL = 5.0
 
 
 #Parent to child
@@ -65,18 +69,32 @@ def redirect_server_output(server_instance, connection: Connection):
 
 
 def die_with_parent():
-    #An executor that outlives its server is worse than one that never started:
-    #it holds the devices with nothing able to reach it. Ask the kernel to end
-    #it when the parent goes, which covers the parent being killed outright.
-    try:
+    """End this process if the server it executes for goes away.
+
+    An executor that outlives its server is worse than one that never started:
+    it holds the devices with nothing able to reach it. The connection already
+    reports a departed parent as EOF, but only while the loop is reading it,
+    which it is not during a prompt - hence the watchdog.
+    """
+
+    if sys.platform.startswith("linux"):
+        #Kernel-enforced, so it still arrives when the interpreter is blocked
+        #inside a collective and the watchdog thread cannot be scheduled.
         PR_SET_PDEATHSIG = 1
         ctypes.CDLL("libc.so.6", use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0)
-    except Exception:
-        logging.warning("Could not ask to be ended along with the server", exc_info=True)
+
+    original_parent = os.getppid()
+
+    def watch_parent():
+        while os.getppid() == original_parent:
+            time.sleep(PARENT_POLL_INTERVAL)
+        os._exit(0)
 
     #The parent may already have gone between the fork and here.
-    if os.getppid() == 1:
+    if os.getppid() != original_parent or original_parent == 1:
         os._exit(0)
+
+    threading.Thread(target=watch_parent, daemon=True).start()
 
 
 def child_main(connection: Connection):
@@ -166,6 +184,11 @@ def child_main(connection: Connection):
             executor.reset()
         else:
             break
+
+
+def is_supported():
+    #The child is reached through an inherited socket, and pass_fds is POSIX only.
+    return not sys.platform.startswith("win")
 
 
 class SubprocessPromptExecutor:

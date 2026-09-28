@@ -336,6 +336,9 @@ def prompt_worker(q, server_instance, asset_manager):
         cache_type = execution.CacheType.NONE
 
     executor_args = dict(cache_type=cache_type, cache_args={ "lru" : args.cache_lru, "ram" : cache_ram, "ram_inactive" : cache_ram_inactive }, asset_manager=asset_manager)
+    if args.gpu_idle_timeout > 0 and not comfy_execution.subprocess_executor.is_supported():
+        logging.warning("--gpu-idle-timeout is not supported on this platform, ignoring it")
+        args.gpu_idle_timeout = 0
     if args.gpu_idle_timeout > 0:
         #Executing in a child process is what makes releasing the devices possible;
         #nothing can hand back a context while the process holding it is alive.
