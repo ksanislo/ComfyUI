@@ -12,6 +12,8 @@ message to the parent to be sent on to clients.
 
 from __future__ import annotations
 
+import atexit
+import ctypes
 import logging
 import os
 import signal
@@ -20,6 +22,10 @@ import subprocess
 import sys
 import threading
 from multiprocessing.connection import Connection
+
+#Nothing under comfy is imported at module scope: the child runs this module as
+#__main__ before it has the server's argv, and comfy.cli_args parses argv when it
+#is imported. Those imports are made where they are needed instead.
 
 #Interrupts reach the child as a signal rather than a message, since it is busy
 #executing rather than reading the connection when one arrives.
@@ -58,7 +64,24 @@ def redirect_server_output(server_instance, connection: Connection):
     return server_instance
 
 
+def die_with_parent():
+    #An executor that outlives its server is worse than one that never started:
+    #it holds the devices with nothing able to reach it. Ask the kernel to end
+    #it when the parent goes, which covers the parent being killed outright.
+    try:
+        PR_SET_PDEATHSIG = 1
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0)
+    except Exception:
+        logging.warning("Could not ask to be ended along with the server", exc_info=True)
+
+    #The parent may already have gone between the fork and here.
+    if os.getppid() == 1:
+        os._exit(0)
+
+
 def child_main(connection: Connection):
+    die_with_parent()
+
     #Imports are deferred until the parent's argv is in place, so the child
     #parses exactly the arguments the server was started with.
     startup = connection.recv()
@@ -171,6 +194,9 @@ class SubprocessPromptExecutor:
 
         import comfy.model_management
         comfy.model_management.add_interrupt_hook(self.interrupt)
+        #Belt as well as braces: the child asks the kernel to end it with us, and
+        #we end it ourselves on an orderly exit.
+        atexit.register(self.shutdown)
 
     def interrupt(self, value=True):
         """Pass an interrupt on to the process actually running the prompt."""
