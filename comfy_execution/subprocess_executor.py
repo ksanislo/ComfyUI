@@ -111,6 +111,13 @@ def child_main(connection: Connection):
     startup = connection.recv()
     sys.argv = startup["argv"]
 
+    #The arguments are parsed only when this is set, so it comes before the
+    #first import of comfy.cli_args - as it does in the server's own first two
+    #lines. Without it the child silently runs on defaults and ignores every
+    #option the server was given.
+    import comfy.options
+    comfy.options.enable_args_parsing()
+
     #The logger goes up before anything else is imported, exactly as the server
     #does it: whatever logs first installs the root handler, and a second one
     #added afterwards reports every line twice.
