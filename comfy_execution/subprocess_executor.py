@@ -105,8 +105,8 @@ def child_main(connection: Connection):
     import execution
     import hook_breaker_ac10a0
     import nodes
-    import comfy.utils
     import server as server_module
+    from comfy_execution.progress import hijack_progress
 
     asyncio_loop = asyncio.new_event_loop()
     asyncio.set_event_loop(asyncio_loop)
@@ -133,16 +133,7 @@ def child_main(connection: Connection):
     ))
     hook_breaker_ac10a0.restore_functions()
 
-    def progress_hook(value, total, preview_image, prompt_id=None, node_id=None):
-        import comfy.model_management
-        comfy.model_management.throw_exception_if_processing_interrupted()
-        execution_server.send_sync(
-            "progress",
-            {"value": value, "max": total, "prompt_id": prompt_id, "node": node_id},
-            execution_server.client_id,
-        )
-
-    comfy.utils.set_progress_bar_global_hook(progress_hook)
+    hijack_progress(execution_server)
 
     executor = execution.PromptExecutor(
         execution_server,
@@ -159,9 +150,12 @@ def child_main(connection: Connection):
 
         command = message[0]
         if command == COMMAND_EXECUTE:
-            _, prompt, prompt_id, extra_data, outputs_to_execute, client_id = message
+            _, prompt, prompt_id, extra_data, outputs_to_execute, client_id, sockets_metadata = message
             execution_server.client_id = client_id
             execution_server.last_prompt_id = prompt_id
+            #Which preview format a client can take is recorded when it connects,
+            #and it connects to the parent.
+            execution_server.sockets_metadata = sockets_metadata
             try:
                 executor.execute(prompt, prompt_id, extra_data, outputs_to_execute)
                 connection.send((MESSAGE_DONE, executor.history_result, executor.success, executor.status_messages))
@@ -293,7 +287,8 @@ class SubprocessPromptExecutor:
 
         client_id = self.server.client_id
         try:
-            connection.send((COMMAND_EXECUTE, prompt, prompt_id, extra_data, execute_outputs, client_id))
+            connection.send((COMMAND_EXECUTE, prompt, prompt_id, extra_data, execute_outputs, client_id,
+                             dict(self.server.sockets_metadata)))
         except Exception as exception:
             logging.error("Could not reach the executor process", exc_info=exception)
             self.shutdown()
