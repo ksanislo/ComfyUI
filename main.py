@@ -235,6 +235,10 @@ import comfy.utils
 
 import execution
 import comfy_execution.subprocess_executor
+
+if args.gpu_idle_timeout > 0 and not comfy_execution.subprocess_executor.is_supported():
+    logging.warning("--gpu-idle-timeout is not supported on this platform, ignoring it")
+    args.gpu_idle_timeout = 0
 import server
 import nodes
 import comfy.model_management
@@ -246,7 +250,11 @@ import comfy.memory_management
 import comfy.model_patcher
 
 
-comfy.dynamic_vram.init_devices(console_log_level)
+#The executor process performs this for itself, and it is the one that loads
+#the models. Doing it here as well would have the server take charge of devices
+#it never uses, and they could not be released while it is running.
+if args.gpu_idle_timeout == 0:
+    comfy.dynamic_vram.init_devices(console_log_level)
 
 
 def cuda_malloc_warning():
@@ -282,9 +290,6 @@ def prompt_worker(q, server_instance, asset_manager):
         cache_type = execution.CacheType.NONE
 
     executor_args = dict(cache_type=cache_type, cache_args={ "lru" : args.cache_lru, "ram" : cache_ram, "ram_inactive" : cache_ram_inactive }, asset_manager=asset_manager)
-    if args.gpu_idle_timeout > 0 and not comfy_execution.subprocess_executor.is_supported():
-        logging.warning("--gpu-idle-timeout is not supported on this platform, ignoring it")
-        args.gpu_idle_timeout = 0
     if args.gpu_idle_timeout > 0:
         #Executing in a child process is what makes releasing the devices possible;
         #nothing can hand back a context while the process holding it is alive.
