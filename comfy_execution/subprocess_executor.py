@@ -259,7 +259,7 @@ class SubprocessPromptExecutor:
         if process is not None and process.poll() is None:
             try:
                 process.send_signal(INTERRUPT_SIGNAL)
-            except Exception:
+            except ProcessLookupError:
                 pass
 
     def reset_state(self):
@@ -317,16 +317,16 @@ class SubprocessPromptExecutor:
         if connection is not None:
             try:
                 connection.close()
-            except Exception:
+            except OSError:
                 pass
         try:
             process.terminate()
             process.wait(timeout=timeout)
-        except Exception:
-            try:
-                process.kill()
-            except Exception:
-                pass
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        except ProcessLookupError:
+            pass
         logging.info("Executor process ended, devices released")
         return True
 
@@ -335,7 +335,7 @@ class SubprocessPromptExecutor:
         if self.is_running():
             try:
                 self.connection.send((COMMAND_RESET,))
-            except Exception:
+            except (OSError, EOFError):
                 self.shutdown()
 
     def execute(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
@@ -348,7 +348,7 @@ class SubprocessPromptExecutor:
         try:
             connection.send((COMMAND_EXECUTE, prompt, prompt_id, extra_data, execute_outputs, client_id,
                              dict(self.server.sockets_metadata)))
-        except Exception as exception:
+        except (OSError, EOFError) as exception:
             logging.error("Could not reach the executor process", exc_info=exception)
             self.shutdown()
             self.success = False
