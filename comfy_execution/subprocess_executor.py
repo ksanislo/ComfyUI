@@ -14,13 +14,17 @@ from __future__ import annotations
 
 import logging
 import os
-import pickle
+import signal
 import socket
 import struct
 import subprocess
 import sys
 import threading
 from multiprocessing.connection import Connection
+
+#Interrupts reach the child as a signal rather than a message, since it is busy
+#executing rather than reading the connection when one arrives.
+INTERRUPT_SIGNAL = signal.SIGUSR1
 
 
 #Parent to child
@@ -102,6 +106,13 @@ def child_main(connection: Connection):
     asyncio_loop = asyncio.new_event_loop()
     asyncio.set_event_loop(asyncio_loop)
 
+    import comfy.model_management
+
+    def handle_interrupt(signum, frame):
+        comfy.model_management.interrupt_current_processing(True)
+
+    signal.signal(INTERRUPT_SIGNAL, handle_interrupt)
+
     execution_server = PipeExecutionServer(connection, client_id=startup.get("client_id"))
 
     #Nodes that were written before the ExecutionServer protocol reach for the
@@ -173,6 +184,20 @@ class SubprocessPromptExecutor:
         self.connection = None
         self.lock = threading.Lock()
         self.reset_state()
+
+        import comfy.model_management
+        comfy.model_management.add_interrupt_hook(self.interrupt)
+
+    def interrupt(self, value=True):
+        """Pass an interrupt on to the process actually running the prompt."""
+        if not value:
+            return
+        process = self.process
+        if process is not None and process.poll() is None:
+            try:
+                process.send_signal(INTERRUPT_SIGNAL)
+            except Exception:
+                pass
 
     def reset_state(self):
         self.history_result = {"outputs": {}, "meta": {}}

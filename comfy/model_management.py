@@ -2301,11 +2301,29 @@ class InterruptProcessingException(BaseException):
 interrupt_processing_mutex = threading.RLock()
 
 interrupt_processing = False
+interrupt_hooks = []
+
+def add_interrupt_hook(hook):
+    #Called whenever processing is interrupted. Lets an executor that runs
+    #elsewhere - in another process, say - hear about it, since the flag below
+    #only reaches code running in this one.
+    interrupt_hooks.append(hook)
+
+def remove_interrupt_hook(hook):
+    if hook in interrupt_hooks:
+        interrupt_hooks.remove(hook)
+
 def interrupt_current_processing(value=True):
     global interrupt_processing
     global interrupt_processing_mutex
     with interrupt_processing_mutex:
         interrupt_processing = value
+
+    for hook in list(interrupt_hooks):
+        try:
+            hook(value)
+        except Exception:
+            logging.exception("Interrupt hook failed")
 
 def processing_interrupted():
     global interrupt_processing
