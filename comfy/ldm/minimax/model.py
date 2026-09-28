@@ -575,12 +575,19 @@ class MiniMaxH3Model(nn.Module):
         if compile_allocations:
             out = [torch.empty_like(x[0]), torch.empty_like(x[1])]
             comfy.model_prefetch.malloc_graph_begin(x[0].device)
-        graph_out = comfy.patcher_extension.WrapperExecutor.new_class_executor(
-            self._forward,
-            self,
-            comfy.patcher_extension.get_all_wrappers(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, transformer_options)
-        ).execute(x, timestep, context, transformer_options, minimax_payload=minimax_payload,
-                  denoise_mask=denoise_mask, audio_denoise_mask=audio_denoise_mask, **kwargs)
+        try:
+            graph_out = comfy.patcher_extension.WrapperExecutor.new_class_executor(
+                self._forward,
+                self,
+                comfy.patcher_extension.get_all_wrappers(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, transformer_options)
+            ).execute(x, timestep, context, transformer_options, minimax_payload=minimax_payload,
+                      denoise_mask=denoise_mask, audio_denoise_mask=audio_denoise_mask, **kwargs)
+        except BaseException:
+            #Leaving without ending the graph keeps its scope pushed for the life
+            #of the process, and the next forward fails to compile against it.
+            if compile_allocations:
+                comfy.model_prefetch.cleanup_malloc_graph()
+            raise
         if compile_allocations:
             out[0].copy_(graph_out[0])
             out[1].copy_(graph_out[1])
