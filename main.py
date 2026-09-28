@@ -249,6 +249,7 @@ if 'torch' in sys.modules:
 import comfy.utils
 
 import execution
+import comfy_execution.subprocess_executor
 import server
 from protocol import BinaryEventTypes
 import nodes
@@ -336,17 +337,28 @@ def prompt_worker(q, server_instance, asset_manager):
     elif args.cache_none:
         cache_type = execution.CacheType.NONE
 
-    e = execution.PromptExecutor(server_instance, cache_type=cache_type, cache_args={ "lru" : args.cache_lru, "ram" : cache_ram, "ram_inactive" : cache_ram_inactive }, asset_manager=asset_manager )
+    executor_args = dict(cache_type=cache_type, cache_args={ "lru" : args.cache_lru, "ram" : cache_ram, "ram_inactive" : cache_ram_inactive }, asset_manager=asset_manager)
+    if args.gpu_idle_timeout > 0:
+        #Executing in a child process is what makes releasing the devices possible;
+        #nothing can hand back a context while the process holding it is alive.
+        e = comfy_execution.subprocess_executor.SubprocessPromptExecutor(server_instance, **executor_args)
+    else:
+        e = execution.PromptExecutor(server_instance, **executor_args)
     last_gc_collect = 0
     need_gc = False
     gc_collect_interval = 10.0
     background_scan_paused = False
+    last_activity = time.perf_counter()
 
     while True:
         try:
             timeout = 1000.0
             if need_gc:
                 timeout = max(gc_collect_interval - (current_time - last_gc_collect), 0.0)
+            if args.gpu_idle_timeout > 0 and e.is_running():
+                #Wake up in time to release the devices once they have been idle
+                #long enough, rather than waiting for the next prompt to arrive.
+                timeout = min(timeout, max(args.gpu_idle_timeout - (time.perf_counter() - last_activity), 0.0))
 
             queue_item = q.get(timeout=timeout)
             if queue_item is not None:
@@ -411,6 +423,12 @@ def prompt_worker(q, server_instance, asset_manager):
                     asset_manager.queue_output_scan()
                     asset_manager.resume_background_scan()
                     background_scan_paused = False
+
+            if args.gpu_idle_timeout > 0:
+                if queue_item is not None:
+                    last_activity = time.perf_counter()
+                elif e.is_running() and (time.perf_counter() - last_activity) >= args.gpu_idle_timeout and q.get_tasks_remaining() == 0:
+                    e.shutdown()
         # BaseException is deliberate. This runs on the worker thread, so Ctrl-C lands in
         # the main thread instead, and resume only flips the seeder's pause state.
         except BaseException:
