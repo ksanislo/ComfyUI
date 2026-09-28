@@ -108,6 +108,21 @@ def child_main(connection: Connection):
     import asyncio
 
     import folder_paths
+    from comfy.cli_args import args, get_console_log_level, get_file_log_outputs
+    from app.logger import setup_logger
+
+    #Without this the child logs through the bare root logger, which drops
+    #everything the model loader reports at INFO.
+    console_log_level = get_console_log_level(args.verbose)
+    setup_logger(log_level=console_log_level,
+                 file_outputs=get_file_log_outputs(args.verbose),
+                 use_stdout=args.log_stdout)
+
+    #This process is the one that loads models onto the devices, so it needs the
+    #same DynamicVRAM setup the server performs - including the headroom asked
+    #for on the command line, which is applied when the devices are handed over.
+    import comfy.dynamic_vram
+    comfy.dynamic_vram.init_control()
 
     #The parent resolved these from extra_model_paths.yaml and the command line;
     #take them wholesale rather than repeating the resolution and risking a
@@ -131,6 +146,8 @@ def child_main(connection: Connection):
 
     import comfy.model_management
     from app.assets.manager import default_asset_manager
+
+    comfy.dynamic_vram.init_devices(console_log_level)
 
     def handle_interrupt(signum, frame):
         comfy.model_management.interrupt_current_processing(True)
