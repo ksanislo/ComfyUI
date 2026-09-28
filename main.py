@@ -236,8 +236,11 @@ import comfy.utils
 import execution
 import comfy_execution.subprocess_executor
 
-if args.gpu_idle_timeout > 0 and not comfy_execution.subprocess_executor.is_supported():
-    logging.warning("--gpu-idle-timeout is not supported on this platform, ignoring it")
+#Releasing the devices requires executing elsewhere, so the timeout implies it.
+execute_in_subprocess = args.execute_in_subprocess or args.gpu_idle_timeout > 0
+if execute_in_subprocess and not comfy_execution.subprocess_executor.is_supported():
+    logging.warning("Executing in a separate process is not supported on this platform, ignoring it")
+    execute_in_subprocess = False
     args.gpu_idle_timeout = 0
 import server
 import nodes
@@ -253,7 +256,7 @@ import comfy.model_patcher
 #The executor process performs this for itself, and it is the one that loads
 #the models. Doing it here as well would have the server take charge of devices
 #it never uses, and they could not be released while it is running.
-if args.gpu_idle_timeout == 0:
+if not execute_in_subprocess:
     comfy.dynamic_vram.init_devices(console_log_level)
 
 
@@ -290,9 +293,10 @@ def prompt_worker(q, server_instance, asset_manager):
         cache_type = execution.CacheType.NONE
 
     executor_args = dict(cache_type=cache_type, cache_args={ "lru" : args.cache_lru, "ram" : cache_ram, "ram_inactive" : cache_ram_inactive }, asset_manager=asset_manager)
-    if args.gpu_idle_timeout > 0:
-        #Executing in a child process is what makes releasing the devices possible;
-        #nothing can hand back a context while the process holding it is alive.
+    if execute_in_subprocess:
+        #Executing in a child process keeps a failure there from reaching the server,
+        #and is what makes releasing the devices possible: nothing can hand back a
+        #context while the process holding it is alive.
         e = comfy_execution.subprocess_executor.SubprocessPromptExecutor(server_instance, **executor_args)
     else:
         e = execution.PromptExecutor(server_instance, **executor_args)

@@ -190,6 +190,7 @@ parser.add_argument("--force-non-blocking", action="store_true", help="Force Com
 parser.add_argument("--default-hashing-function", type=str, choices=['md5', 'sha1', 'sha256', 'sha512'], default='sha256', help="Allows you to choose the hash function to use for duplicate filename / contents comparison. Default is sha256.")
 
 parser.add_argument("--disable-smart-memory", action="store_true", help="Force ComfyUI to agressively offload to regular ram instead of keeping models in vram when it can.")
+parser.add_argument("--execute-in-subprocess", action="store_true", help="Run prompt execution in a separate process, so that a failure while executing cannot take the server with it. Implied by --gpu-idle-timeout.")
 parser.add_argument("--gpu-idle-timeout", type=float, default=0, help="Seconds of inactivity after which the devices are released, letting them drop to their idle power state while the server keeps running. Prompts are executed in a separate process so this is possible, and the next prompt after a release starts it again and reloads models. Disabled by default.")
 parser.add_argument("--deterministic", action="store_true", help="Make pytorch use slower deterministic algorithms when it can. Note that this might not make images deterministic in all cases.")
 
