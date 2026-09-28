@@ -11,8 +11,6 @@ if TYPE_CHECKING:
 from protocol import BinaryEventTypes
 from comfy_api import feature_flags
 from comfy_execution.utils import get_executing_context
-import comfy.model_management
-import comfy.utils
 
 PreviewImageTuple = Tuple[str, Image.Image, Optional[int]]
 
@@ -353,6 +351,12 @@ def get_progress_state() -> ProgressRegistry:
 
 
 def hijack_progress(server_instance):
+    #Imported here rather than at module scope: comfy.model_management pulls in
+    #comfy_aimdo.host_buffer, which captures the aimdo library handle when it is
+    #first imported, and this module is imported before that library is set up.
+    import comfy.model_management
+    import comfy.utils
+
     def hook(value, total, preview_image, prompt_id=None, node_id=None):
         executing_context = get_executing_context()
         if prompt_id is None and executing_context is not None:
