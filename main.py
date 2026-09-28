@@ -16,7 +16,6 @@ import shutil
 import importlib.metadata
 import folder_paths
 import time
-from comfy.cli_args import enables_dynamic_vram
 from app.logger import setup_logger
 console_log_level = get_console_log_level(args.verbose)
 file_log_outputs = get_file_log_outputs(args.verbose)
@@ -32,8 +31,7 @@ import faulthandler
 import logging
 import signal
 import sys
-from comfy_execution.progress import get_progress_state
-from comfy_execution.utils import get_executing_context
+from comfy_execution.progress import hijack_progress
 from comfy_api import feature_flags
 
 if __name__ == "__main__":
@@ -66,22 +64,9 @@ if __name__ == "__main__" and args.debug_hang:
 
     signal.signal(signal.SIGINT, dump_traceback_on_sigint)
 
-import comfy_aimdo.control
+import comfy.dynamic_vram
 
-if enables_dynamic_vram():
-    simple_vram_headroom = None if args.reserve_vram is None else int(args.reserve_vram * 1024 ** 3)
-    try:
-        comfy_aimdo.control.init(simple_vram_headroom=simple_vram_headroom, nvml_pressure=not args.disable_nvml_pressure)
-    except TypeError:
-        # comfy-aimdo 0.4.10 protocol.
-        try:
-            comfy_aimdo.control.init(simple_vram_headroom=simple_vram_headroom)
-        except TypeError:
-            # comfy-aimdo 0.4.9 protocol.
-            comfy_aimdo.control.init()
-
-if os.name == "nt":
-    os.environ['MIMALLOC_PURGE_DELAY'] = '0'
+comfy.dynamic_vram.init_control()
 
 if __name__ == "__main__":
     os.environ['TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL'] = '1'
@@ -249,8 +234,15 @@ if 'torch' in sys.modules:
 import comfy.utils
 
 import execution
+import comfy_execution.subprocess_executor
+
+#Releasing the devices requires executing elsewhere, so the timeout implies it.
+execute_in_subprocess = args.execute_in_subprocess or args.gpu_idle_timeout > 0
+if execute_in_subprocess and not comfy_execution.subprocess_executor.is_supported():
+    logging.warning("Executing in a separate process is not supported on this platform, ignoring it")
+    execute_in_subprocess = False
+    args.gpu_idle_timeout = 0
 import server
-from protocol import BinaryEventTypes
 import nodes
 import comfy.model_management
 import comfyui_version
@@ -261,47 +253,11 @@ import comfy.memory_management
 import comfy.model_patcher
 
 
-def dynamic_vram_supported():
-    if comfy.model_management.is_nvidia():
-        return True
-    if comfy.model_management.is_amd():
-        if comfy.model_management.rocm_version >= (7, 14):
-            return True
-    return False
-
-
-if args.enable_dynamic_vram or (enables_dynamic_vram() and dynamic_vram_supported()):
-    if (not args.enable_dynamic_vram) and (comfy.model_management.torch_version_numeric < (2, 8)):
-        logging.warning("Unsupported Pytorch detected. DynamicVRAM support requires Pytorch version 2.8 or later (2.12+ is recommended). Falling back to legacy ModelPatcher. VRAM estimates may be unreliable especially on Windows")
-    else:
-        try:
-            aimdo_initialized = comfy_aimdo.control.init_devices((d.index, int(args.vram_headroom * 1024 ** 3)) for d in comfy.model_management.get_all_torch_devices())
-        except TypeError:
-            # comfy-aimdo 0.4.9 protocol.
-            aimdo_initialized = comfy_aimdo.control.init_devices(d.index for d in comfy.model_management.get_all_torch_devices())
-
-        if aimdo_initialized:
-            if console_log_level == 'DEBUG':
-                comfy_aimdo.control.set_log_debug()
-            elif console_log_level == 'DETAIL':
-                try:
-                    comfy_aimdo.control.set_log_detail()
-                except AttributeError:
-                    comfy_aimdo.control.set_log_info()
-            elif console_log_level == 'CRITICAL':
-                comfy_aimdo.control.set_log_critical()
-            elif console_log_level == 'ERROR':
-                comfy_aimdo.control.set_log_error()
-            elif console_log_level == 'WARNING':
-                comfy_aimdo.control.set_log_warning()
-            else: #INFO
-                comfy_aimdo.control.set_log_info()
-
-            comfy.model_patcher.CoreModelPatcher = comfy.model_patcher.ModelPatcherDynamic
-            comfy.memory_management.aimdo_enabled = True
-            logging.info("DynamicVRAM support detected and enabled")
-        else:
-            logging.warning("No working comfy-aimdo install detected. DynamicVRAM support disabled. Falling back to legacy ModelPatcher. VRAM estimates may be unreliable especially on Windows")
+#The executor process performs this for itself, and it is the one that loads
+#the models. Doing it here as well would have the server take charge of devices
+#it never uses, and they could not be released while it is running.
+if not execute_in_subprocess:
+    comfy.dynamic_vram.init_devices(console_log_level)
 
 
 def cuda_malloc_warning():
@@ -336,17 +292,29 @@ def prompt_worker(q, server_instance, asset_manager):
     elif args.cache_none:
         cache_type = execution.CacheType.NONE
 
-    e = execution.PromptExecutor(server_instance, cache_type=cache_type, cache_args={ "lru" : args.cache_lru, "ram" : cache_ram, "ram_inactive" : cache_ram_inactive }, asset_manager=asset_manager )
+    executor_args = dict(cache_type=cache_type, cache_args={ "lru" : args.cache_lru, "ram" : cache_ram, "ram_inactive" : cache_ram_inactive }, asset_manager=asset_manager)
+    if execute_in_subprocess:
+        #Executing in a child process keeps a failure there from reaching the server,
+        #and is what makes releasing the devices possible: nothing can hand back a
+        #context while the process holding it is alive.
+        e = comfy_execution.subprocess_executor.SubprocessPromptExecutor(server_instance, **executor_args)
+    else:
+        e = execution.PromptExecutor(server_instance, **executor_args)
     last_gc_collect = 0
     need_gc = False
     gc_collect_interval = 10.0
     background_scan_paused = False
+    last_activity = time.perf_counter()
 
     while True:
         try:
             timeout = 1000.0
             if need_gc:
                 timeout = max(gc_collect_interval - (current_time - last_gc_collect), 0.0)
+            if args.gpu_idle_timeout > 0 and e.is_running():
+                #Wake up in time to release the devices once they have been idle
+                #long enough, rather than waiting for the next prompt to arrive.
+                timeout = min(timeout, max(args.gpu_idle_timeout - (time.perf_counter() - last_activity), 0.0))
 
             queue_item = q.get(timeout=timeout)
             if queue_item is not None:
@@ -411,6 +379,12 @@ def prompt_worker(q, server_instance, asset_manager):
                     asset_manager.queue_output_scan()
                     asset_manager.resume_background_scan()
                     background_scan_paused = False
+
+            if args.gpu_idle_timeout > 0:
+                if queue_item is not None:
+                    last_activity = time.perf_counter()
+                elif e.is_running() and (time.perf_counter() - last_activity) >= args.gpu_idle_timeout and q.get_tasks_remaining() == 0:
+                    e.shutdown()
         # BaseException is deliberate. This runs on the worker thread, so Ctrl-C lands in
         # the main thread instead, and resume only flips the seeder's pause state.
         except BaseException:
@@ -429,38 +403,6 @@ async def run(server_instance, address='', port=8188, verbose=True, call_on_star
     await asyncio.gather(
         server_instance.start_multi_address(addresses, call_on_start, verbose), server_instance.publish_loop()
     )
-
-def hijack_progress(server_instance):
-    def hook(value, total, preview_image, prompt_id=None, node_id=None):
-        executing_context = get_executing_context()
-        if prompt_id is None and executing_context is not None:
-            prompt_id = executing_context.prompt_id
-        if node_id is None and executing_context is not None:
-            node_id = executing_context.node_id
-        comfy.model_management.throw_exception_if_processing_interrupted()
-        if prompt_id is None:
-            prompt_id = server_instance.last_prompt_id
-        if node_id is None:
-            node_id = server_instance.last_node_id
-        progress = {"value": value, "max": total, "prompt_id": prompt_id, "node": node_id}
-        get_progress_state().update_progress(node_id, value, total, preview_image)
-
-        server_instance.send_sync("progress", progress, server_instance.client_id)
-        if preview_image is not None:
-            # Only send old method if client doesn't support preview metadata
-            if not feature_flags.supports_feature(
-                server_instance.sockets_metadata,
-                server_instance.client_id,
-                "supports_preview_metadata",
-            ):
-                server_instance.send_sync(
-                    BinaryEventTypes.UNENCODED_PREVIEW_IMAGE,
-                    preview_image,
-                    server_instance.client_id,
-                )
-
-    comfy.utils.set_progress_bar_global_hook(hook)
-
 
 def setup_database(asset_manager):
     if not dependencies_available():

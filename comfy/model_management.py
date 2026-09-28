@@ -21,6 +21,7 @@ import psutil
 import logging
 from enum import Enum
 from comfy.cli_args import args, PerformanceFeature
+import ctypes
 import threading
 import torch
 import sys
@@ -355,13 +356,112 @@ def get_total_memory(dev=None, torch_total_too=False):
     else:
         return mem_total
 
+def get_total_memory_no_init(dev=None):
+    #Same figure as get_total_memory() without bringing the device up. The memory
+    #info call it uses creates a context on the device; the device properties carry
+    #the same total and can be read without one.
+    global directml_enabled
+    if dev is None:
+        dev = get_torch_device()
+
+    if hasattr(dev, 'type') and (dev.type == 'cpu' or dev.type == 'mps'):
+        return comfy.system_memory.virtual_memory_total()
+
+    if directml_enabled:
+        return 1024 * 1024 * 1024 #TODO
+
+    try:
+        if is_intel_xpu():
+            return torch.xpu.get_device_properties(dev).total_memory
+        elif is_ascend_npu():
+            return torch.npu.get_device_properties(dev).total_memory
+        elif is_mlu():
+            return torch.mlu.get_device_properties(dev).total_memory
+        else:
+            return torch.cuda.get_device_properties(dev).total_memory
+    except Exception:
+        #A backend whose device properties carry no total still gets a correct
+        #answer, at the cost of initializing the device.
+        return get_total_memory(dev)
+
+def device_allocator_active(dev=None):
+    #Whether this process' allocator holds memory on dev. Reads the allocator's own
+    #bookkeeping, which an untouched device answers with zero rather than bringing
+    #itself up. Unknown backends report True so callers keep their previous behaviour.
+    if dev is None:
+        dev = get_torch_device()
+
+    if hasattr(dev, 'type') and (dev.type == 'cpu' or dev.type == 'mps'):
+        return True
+
+    try:
+        if is_intel_xpu():
+            return torch.xpu.memory_reserved(dev) > 0
+        elif is_ascend_npu():
+            return torch.npu.memory_reserved(dev) > 0
+        elif is_mlu():
+            return torch.mlu.memory_reserved(dev) > 0
+        elif torch.cuda.is_available():
+            return torch.cuda.memory_reserved(dev) > 0
+    except Exception:
+        pass
+    return True
+
+class _NvmlMemory(ctypes.Structure):
+    _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
+
+nvml_library = None #None until tried, False when unavailable
+nvml_handles = {}
+
+def get_nvml_library():
+    global nvml_library
+    if nvml_library is None:
+        try:
+            library = ctypes.CDLL("libnvidia-ml.so.1")
+            if library.nvmlInit_v2() != 0:
+                raise OSError("nvmlInit_v2 failed")
+            nvml_library = library
+        except Exception:
+            nvml_library = False
+    return nvml_library or None
+
+def nvml_free_memory(dev):
+    #Free memory on dev read straight from the driver, without initializing the
+    #device. Returns None when that is not possible, leaving the caller to fall
+    #back to the accurate path.
+    #
+    #Devices are matched by UUID rather than index: NVML enumerates every card on
+    #the machine while torch only sees the ones CUDA_VISIBLE_DEVICES exposes, so
+    #the two orderings need not agree. The UUID also survives the card changing
+    #slots and distinguishes MIG instances, which share a PCI address.
+    library = get_nvml_library()
+    if library is None:
+        return None
+
+    try:
+        index = 0 if dev.index is None else dev.index
+        handle = nvml_handles.get(index)
+        if handle is None:
+            uuid = torch.cuda.get_device_properties(dev).uuid
+            handle = ctypes.c_void_p()
+            if library.nvmlDeviceGetHandleByUUID("GPU-{}".format(uuid).encode(), ctypes.byref(handle)) != 0:
+                return None
+            nvml_handles[index] = handle
+
+        memory = _NvmlMemory()
+        if library.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(memory)) != 0:
+            return None
+        return memory.free
+    except Exception:
+        return None
+
 def mac_version():
     try:
         return tuple(int(n) for n in platform.mac_ver()[0].split("."))
     except:
         return None
 
-total_vram = get_total_memory(get_torch_device()) / (1024 * 1024)
+total_vram = get_total_memory_no_init(get_torch_device()) / (1024 * 1024)
 total_ram = comfy.system_memory.virtual_memory_total() / (1024 * 1024)
 logging.info("Total VRAM {:0.0f} MB, total RAM {:0.0f} MB".format(total_vram, total_ram))
 cgroup_ram_limit = comfy.system_memory.cgroup_memory_limit()
@@ -930,7 +1030,9 @@ def free_memory(memory_required, device, keep_loaded=[], for_dynamic=False, pins
     if len(unloaded_model) > 0:
         soft_empty_cache()
     elif device is not None:
-        if vram_state != VRAMState.HIGH_VRAM:
+        #Nothing was unloaded. With no allocator memory on the device there is
+        #nothing to release, and asking how much is free would bring it up.
+        if vram_state != VRAMState.HIGH_VRAM and device_allocator_active(device):
             mem_free_total, mem_free_torch = get_free_memory(device, torch_free_too=True)
             if mem_free_torch > mem_free_total * 0.25:
                 soft_empty_cache()
@@ -1845,6 +1947,23 @@ def get_free_memory(dev=None, torch_free_too=False):
     else:
         return mem_free_total
 
+def get_device_memory_report(dev):
+    #(total, free, torch_total, torch_free) for reporting, which unlike the
+    #allocation path has no reason to initialize a device nothing is using. An
+    #idle device answers from its properties, its allocator and the driver; one
+    #that is in use takes the accurate path, having already been brought up.
+    if not device_allocator_active(dev):
+        mem_free = None
+        if getattr(dev, "type", None) == "cuda" and is_nvidia():
+            mem_free = nvml_free_memory(dev)
+        if mem_free is not None:
+            #Nothing is reserved on an idle device, so torch holds none of it.
+            return (get_total_memory_no_init(dev), mem_free, 0, 0)
+
+    mem_total, mem_total_torch = get_total_memory(dev, torch_total_too=True)
+    mem_free, mem_free_torch = get_free_memory(dev, torch_free_too=True)
+    return (mem_total, mem_free, mem_total_torch, mem_free_torch)
+
 def cpu_mode():
     global cpu_state
     return cpu_state == CPUState.CPU
@@ -2133,6 +2252,10 @@ def soft_empty_cache(force=False):
     elif is_mlu():
         torch.mlu.empty_cache()
     elif torch.cuda.is_available():
+        if not device_allocator_active():
+            #An allocator holding nothing has nothing to empty, and synchronizing
+            #would only serve to create a context on an otherwise untouched device.
+            return
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
@@ -2178,11 +2301,29 @@ class InterruptProcessingException(BaseException):
 interrupt_processing_mutex = threading.RLock()
 
 interrupt_processing = False
+interrupt_hooks = []
+
+def add_interrupt_hook(hook):
+    #Called whenever processing is interrupted. Lets an executor that runs
+    #elsewhere - in another process, say - hear about it, since the flag below
+    #only reaches code running in this one.
+    interrupt_hooks.append(hook)
+
+def remove_interrupt_hook(hook):
+    if hook in interrupt_hooks:
+        interrupt_hooks.remove(hook)
+
 def interrupt_current_processing(value=True):
     global interrupt_processing
     global interrupt_processing_mutex
     with interrupt_processing_mutex:
         interrupt_processing = value
+
+    for hook in list(interrupt_hooks):
+        try:
+            hook(value)
+        except Exception:
+            logging.exception("Interrupt hook failed")
 
 def processing_interrupted():
     global interrupt_processing
