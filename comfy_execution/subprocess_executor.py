@@ -338,6 +338,28 @@ class SubprocessPromptExecutor:
             except (OSError, EOFError):
                 self.shutdown()
 
+    def report_died(self, prompt_id, message):
+        """Tell the client the prompt is over, the way a failing node would.
+
+        Without this the executor can vanish mid-prompt and the interface waits
+        for a result that is never coming.
+        """
+        self.success = False
+        data = {
+            "prompt_id": prompt_id,
+            "node_id": None,
+            "node_type": None,
+            "executed": [],
+            "exception_message": message,
+            "exception_type": "ExecutorProcessEnded",
+            "traceback": [],
+            "current_inputs": {},
+            "current_outputs": [],
+            "timestamp": int(time.time() * 1000),
+        }
+        self.status_messages.append(("execution_error", data))
+        self.server.send_sync("execution_error", data, self.server.client_id)
+
     def execute(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
         self.reset_state()
         with self.lock:
@@ -351,7 +373,7 @@ class SubprocessPromptExecutor:
         except (OSError, EOFError) as exception:
             logging.error("Could not reach the executor process", exc_info=exception)
             self.shutdown()
-            self.success = False
+            self.report_died(prompt_id, "Could not reach the process running the prompt.")
             return
 
         while True:
@@ -361,7 +383,7 @@ class SubprocessPromptExecutor:
                 #The child died mid-prompt; report it rather than hanging.
                 logging.error("The executor process ended during execution")
                 self.shutdown()
-                self.success = False
+                self.report_died(prompt_id, "The process running the prompt ended unexpectedly.")
                 return
 
             kind = message[0]
