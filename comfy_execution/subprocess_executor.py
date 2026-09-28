@@ -16,7 +16,6 @@ import logging
 import os
 import signal
 import socket
-import struct
 import subprocess
 import sys
 import threading
@@ -37,43 +36,26 @@ MESSAGE_QUEUE_UPDATED = "queue_updated"
 MESSAGE_DONE = "done"
 
 
-class PipeExecutionServer:
-    """The ExecutionServer the child hands to its executor.
+def redirect_server_output(server_instance, connection: Connection):
+    """Send what this server reports to the parent instead of to its own clients.
 
-    Everything the executor and the nodes report is forwarded to the parent,
-    which owns the actual client connections.
+    The child builds a real server rather than a stand-in, because nodes reach
+    for far more of it than the ExecutionServer protocol describes - the queue,
+    the managers, the routes - and a stand-in has to grow an attribute every
+    time one of them wants something new. Only the two methods that would talk
+    to clients are replaced; the clients are attached to the parent.
     """
 
-    def __init__(self, connection: Connection, client_id=None):
-        from app.node_replace_manager import NodeReplaceManager
+    def send_sync(event, data, sid=None):
+        connection.send((MESSAGE_SEND, event, data, sid))
 
-        self.connection = connection
-        self.client_id = client_id
-        self.last_node_id = None
-        self.last_prompt_id = None
-        self.sockets_metadata = {}
-        #Registered into during node import, and read back during execution, so
-        #the child needs its own rather than a handle on the parent's.
-        self.node_replace_manager = NodeReplaceManager()
+    def queue_updated():
+        #The queue that matters lives in the parent, so it answers this one.
+        connection.send((MESSAGE_QUEUE_UPDATED,))
 
-    def send_sync(self, event, data, sid=None):
-        self.connection.send((MESSAGE_SEND, event, data, sid))
-
-    def queue_updated(self):
-        #The queue lives in the parent, so it answers this one.
-        self.connection.send((MESSAGE_QUEUE_UPDATED,))
-
-    def send_progress_text(self, text, node_id, sid=None):
-        #Same wire format as the real server, so clients cannot tell the
-        #difference. Kept here because nodes reach for it directly.
-        from comfy.cli_args import args  # noqa: F401  (keeps import ordering honest)
-        from server import BinaryEventTypes
-
-        if isinstance(text, str):
-            text = text.encode("utf-8")
-        node_id_bytes = str(node_id).encode("utf-8")
-        message = struct.pack(">I", len(node_id_bytes)) + node_id_bytes + text
-        self.send_sync(BinaryEventTypes.TEXT, message, sid)
+    server_instance.send_sync = send_sync
+    server_instance.queue_updated = queue_updated
+    return server_instance
 
 
 def child_main(connection: Connection):
@@ -107,23 +89,24 @@ def child_main(connection: Connection):
     asyncio.set_event_loop(asyncio_loop)
 
     import comfy.model_management
+    from app.assets.manager import default_asset_manager
 
     def handle_interrupt(signum, frame):
         comfy.model_management.interrupt_current_processing(True)
 
     signal.signal(INTERRUPT_SIGNAL, handle_interrupt)
 
-    execution_server = PipeExecutionServer(connection, client_id=startup.get("client_id"))
-
-    #Nodes that were written before the ExecutionServer protocol reach for the
-    #server singleton directly. Point it at the forwarding one so they keep working.
-    if getattr(server_module.PromptServer, "instance", None) is None:
-        server_module.PromptServer.instance = execution_server
+    #Constructing the server registers it as the singleton the nodes look for.
+    #It is never started, so it binds nothing and serves no one.
+    asset_manager = default_asset_manager()
+    execution_server = redirect_server_output(
+        server_module.PromptServer(asyncio_loop, asset_manager), connection)
+    execution_server.client_id = startup["client_id"]
 
     hook_breaker_ac10a0.save_functions()
     asyncio_loop.run_until_complete(nodes.init_extra_nodes(
-        init_custom_nodes=startup.get("init_custom_nodes", True),
-        init_api_nodes=startup.get("init_api_nodes", True),
+        init_custom_nodes=startup["init_custom_nodes"],
+        init_api_nodes=startup["init_api_nodes"],
     ))
     hook_breaker_ac10a0.restore_functions()
 
@@ -142,6 +125,7 @@ def child_main(connection: Connection):
         execution_server,
         cache_type=startup["cache_type"],
         cache_args=startup["cache_args"],
+        asset_manager=asset_manager,
     )
 
     while True:
@@ -230,7 +214,7 @@ class SubprocessPromptExecutor:
             "argv": list(sys.argv),
             "cache_type": self.cache_type,
             "cache_args": self.cache_args,
-            "client_id": getattr(self.server, "client_id", None),
+            "client_id": self.server.client_id,
             "init_custom_nodes": (not args.disable_all_custom_nodes) or len(args.whitelist_custom_nodes) > 0,
             "init_api_nodes": not args.disable_api_nodes,
             "folder_names_and_paths": folder_paths.folder_names_and_paths,
@@ -281,7 +265,7 @@ class SubprocessPromptExecutor:
             self.start()
             connection = self.connection
 
-        client_id = getattr(self.server, "client_id", None)
+        client_id = self.server.client_id
         try:
             connection.send((COMMAND_EXECUTE, prompt, prompt_id, extra_data, execute_outputs, client_id))
         except Exception as exception:
