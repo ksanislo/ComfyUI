@@ -13,6 +13,7 @@ message to the parent to be sent on to clients.
 from __future__ import annotations
 
 import atexit
+import enum
 import ctypes
 import logging
 import os
@@ -27,6 +28,11 @@ from multiprocessing.connection import Connection
 #Nothing under comfy is imported at module scope: the child runs this module as
 #__main__ before it has the server's argv, and comfy.cli_args parses argv when it
 #is imported. Those imports are made where they are needed instead.
+
+#For the same reason the startup message carries plain data only. Unpickling a
+#value imports the module that defines it, and the message is read before the
+#argv it carries has been applied, so anything richer drags the device modules in
+#too early to be set up correctly.
 
 #Interrupts reach the child as a signal rather than a message, since it is busy
 #executing rather than reading the connection when one arrives.
@@ -105,18 +111,20 @@ def child_main(connection: Connection):
     startup = connection.recv()
     sys.argv = startup["argv"]
 
-    import asyncio
-
-    import folder_paths
+    #The logger goes up before anything else is imported, exactly as the server
+    #does it: whatever logs first installs the root handler, and a second one
+    #added afterwards reports every line twice.
     from comfy.cli_args import args, get_console_log_level, get_file_log_outputs
     from app.logger import setup_logger
 
-    #Without this the child logs through the bare root logger, which drops
-    #everything the model loader reports at INFO.
     console_log_level = get_console_log_level(args.verbose)
     setup_logger(log_level=console_log_level,
                  file_outputs=get_file_log_outputs(args.verbose),
                  use_stdout=args.log_stdout)
+
+    import asyncio
+
+    import folder_paths
 
     #This process is the one that loads models onto the devices, so it needs the
     #same DynamicVRAM setup the server performs - including the headroom asked
@@ -170,9 +178,13 @@ def child_main(connection: Connection):
 
     hijack_progress(execution_server)
 
+    cache_type = startup["cache_type"]
+    if isinstance(cache_type, str):
+        cache_type = execution.CacheType[cache_type]
+
     executor = execution.PromptExecutor(
         execution_server,
-        cache_type=startup["cache_type"],
+        cache_type=cache_type,
         cache_args=startup["cache_args"],
         asset_manager=asset_manager,
     )
@@ -272,7 +284,7 @@ class SubprocessPromptExecutor:
         self.connection = Connection(parent_socket.detach())
         self.connection.send({
             "argv": list(sys.argv),
-            "cache_type": self.cache_type,
+            "cache_type": self.cache_type.name if isinstance(self.cache_type, enum.Enum) else self.cache_type,
             "cache_args": self.cache_args,
             "client_id": self.server.client_id,
             "init_custom_nodes": (not args.disable_all_custom_nodes) or len(args.whitelist_custom_nodes) > 0,
