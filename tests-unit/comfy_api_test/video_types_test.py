@@ -1573,3 +1573,26 @@ def test_save_to_preset_transcodes_playable_output(tmp_path):
         assert tuple(saved.images.shape[1:3]) == (16, 16)
     finally:
         os.unlink(source)
+
+
+def test_video_from_components_save_reports_progress_per_frame(monkeypatch):
+    """Saving advances a progress bar once per encoded frame."""
+    import comfy.utils
+
+    updates = []
+
+    class Bar:
+        def __init__(self, total):
+            updates.append(("total", total))
+
+        def update(self, value):
+            updates.append(("step", value))
+
+    monkeypatch.setattr(comfy.utils, "ProgressBar", Bar)
+    images = torch.rand(5, 16, 16, 3)
+    components = VideoComponents(images=images, frame_rate=Fraction(24))
+
+    VideoFromComponents(components).save_to(io.BytesIO(), format=VideoContainer.MP4, codec=VideoCodec.H264)
+
+    assert updates[0] == ("total", 5)
+    assert updates[1:] == [("step", 1)] * 5

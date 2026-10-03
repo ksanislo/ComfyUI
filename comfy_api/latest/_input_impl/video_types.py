@@ -1167,6 +1167,7 @@ class VideoFromComponents(VideoInput):
                     audio_resampler = av.audio.resampler.AudioResampler(format="fltp", layout=layout, rate=audio_sample_rate)
 
             # Encode video
+            pbar = comfy.utils.ProgressBar(self.__components.images.shape[0])
             for i, frame in enumerate(self.__components.images):
                 if is_10bit:
                     # 16-bit RGB keeps float precision through the conversion to 10-bit YUV.
@@ -1185,6 +1186,7 @@ class VideoFromComponents(VideoInput):
                     set_video_color_properties(frame, color_space)
                 packet = video_stream.encode(frame)
                 output.mux(packet)
+                pbar.update(1)
 
             # Flush video
             packet = video_stream.encode(None)
