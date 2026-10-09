@@ -770,8 +770,7 @@ class PromptServer():
 
             device_entries = []
             for d in torch_devices:
-                vram_total, torch_vram_total = comfy.model_management.get_total_memory(d, torch_total_too=True)
-                vram_free, torch_vram_free = comfy.model_management.get_free_memory(d, torch_free_too=True)
+                vram_total, vram_free, torch_vram_total, torch_vram_free = comfy.model_management.get_device_memory_report(d)
                 device_entries.append({
                     "name": comfy.model_management.get_torch_device_name(d),
                     "type": d.type,
