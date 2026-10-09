@@ -10,6 +10,9 @@ import comfy_kitchen
 from comfy.ldm.modules.attention import optimized_attention_for_device
 import comfy.model_management
 import comfy.model_prefetch
+
+#Below this a text encoder is quick enough that a progress bar is noise.
+PROGRESS_MIN_LAYERS = 32
 import comfy.ops
 import comfy.ldm.common_dit
 import comfy.clip_model
@@ -1002,6 +1005,12 @@ class Llama2_(nn.Module):
 
         prefetch_queue = comfy.model_prefetch.make_prefetch_queue(list(self.layers), x.device, {"prefetch_dynamic_vbars": self.prefetch_dynamic_vbars and past_key_values is not None})
         next_key_values = list(past_key_values) if past_key_values is not None else []
+        #Reported per layer once there are enough of them to be worth watching. A
+        #small encoder finishes before a bar would mean anything, but a large one
+        #runs for tens of seconds with nothing shown, and the progress hook is
+        #also where an interrupt is noticed - without it the encode cannot be
+        #cancelled until it has finished.
+        pbar = comfy.utils.ProgressBar(len(self.layers)) if len(self.layers) >= PROGRESS_MIN_LAYERS else None
         for i, layer in enumerate(self.layers):
             if all_intermediate is not None:
                 if only_layers is None or (i in only_layers):
@@ -1036,6 +1045,9 @@ class Llama2_(nn.Module):
             )
             if fixed_kv:
                 next_key_values[i].advance(seq_len)
+
+            if pbar is not None:
+                pbar.update(1)
 
             # DeepStack: add per-layer visual features into the first len() decoder layers at image positions (Qwen3-VL)
             if deepstack_embeds is not None and i < len(deepstack_embeds):
