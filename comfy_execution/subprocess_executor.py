@@ -146,7 +146,10 @@ def child_main(connection: Connection):
     for name, setter in (("output_directory", folder_paths.set_output_directory),
                          ("input_directory", folder_paths.set_input_directory),
                          ("user_directory", folder_paths.set_user_directory),
-                         ("temp_directory", folder_paths.set_temp_directory)):
+                         ("temp_directory", folder_paths.set_temp_directory),
+                         ("previews_directory", getattr(folder_paths, "set_previews_directory", None))):
+        if setter is None:
+            continue
         if startup.get(name) is not None:
             setter(startup[name])
 
@@ -301,6 +304,7 @@ class SubprocessPromptExecutor:
             "input_directory": folder_paths.get_input_directory(),
             "user_directory": folder_paths.get_user_directory(),
             "temp_directory": folder_paths.get_temp_directory(),
+            "previews_directory": folder_paths.get_previews_directory() if hasattr(folder_paths, "get_previews_directory") else None,
         })
         logging.info("Executor process started (pid {})".format(self.process.pid))
 
