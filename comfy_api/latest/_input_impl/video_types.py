@@ -1374,6 +1374,7 @@ class VideoFromComponents(VideoInput):
                     audio_resampler = av.audio.resampler.AudioResampler(format="fltp", layout=layout, rate=audio_sample_rate)
 
             # Encode video
+            pbar = comfy.utils.ProgressBar(self.__components.images.shape[0])
             for i, frame in enumerate(self.__components.images):
                 if save_alpha and self.__components.alpha is not None:
                     frame = torch.cat((frame[..., :3], self.__components.alpha[i].reshape(*frame.shape[:2], 1).to(frame)), dim=-1)
@@ -1396,6 +1397,7 @@ class VideoFromComponents(VideoInput):
                     set_video_color_properties(frame, color_space)
                 packet = video_stream.encode(frame)
                 output.mux(packet)
+                pbar.update(1)
 
             # Flush video
             packet = video_stream.encode(None)
